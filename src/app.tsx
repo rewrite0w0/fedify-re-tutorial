@@ -2,12 +2,103 @@
 import { Hono } from "hono";
 import { federation } from "@fedify/hono";
 import fedi from "./federation.ts";
-import { Layout, SetupForm, Profile, FollowerList, Home } from "./views.tsx";
+import { Note } from "@fedify/vocab";
+import {
+  Layout,
+  SetupForm,
+  Profile,
+  FollowerList,
+  Home,
+  PostPage,
+} from "./views.tsx";
 import db from "./db.ts";
-import type { User, Actor } from "./schema.ts";
+import type { User, Actor, Post } from "./schema.ts";
+import { stringifyEntities } from "stringify-entities";
 
 const app = new Hono();
 app.use(federation(fedi, () => undefined));
+
+app.get("/users/:username/posts/:id", (c) => {
+  const post = db
+    .prepare<unknown[], Post & Actor & User>(
+      `
+      SELECT users.*, actors.*, posts.*
+      FROM posts
+      JOIN actors ON actors.id = posts.actor_id
+      JOIN users ON users.id = actors.user_id
+      WHERE users.username = ? AND posts.id = ?
+      `,
+    )
+    .get(c.req.param("username"), c.req.param("id"));
+  if (post == null) return c.notFound();
+
+  // biome-ignore lint/style/noNonNullAssertion: 언제나 하나의 레코드를 반환
+  const { followers } = db
+    .prepare<unknown[], { followers: number }>(
+      `
+      SELECT count(*) AS followers
+      FROM follows
+      WHERE follows.following_id = ?
+      `,
+    )
+    .get(post.actor_id)!;
+  return c.html(
+    <Layout>
+      <PostPage
+        name={post.name ?? post.username}
+        username={post.username}
+        handle={post.handle}
+        followers={followers}
+        post={post}
+      />
+    </Layout>,
+  );
+});
+
+app.post("/users/:username/posts", async (c) => {
+  const username = c.req.param("username");
+  const actor = db
+    .prepare<unknown[], Actor>(
+      `
+      SELECT actors.*
+      FROM actors
+      JOIN users ON users.id = actors.user_id
+      WHERE users.username = ?
+      `,
+    )
+    .get(username);
+  if (actor == null) return c.redirect("/setup");
+  const form = await c.req.formData();
+  const content = form.get("content")?.toString();
+  if (content == null || content.trim() === "") {
+    return c.text("Content is required", 400);
+  }
+  const ctx = fedi.createContext(c.req.raw, undefined);
+  const url: string | null = db.transaction(() => {
+    const post = db
+      .prepare<unknown[], Post>(
+        `
+        INSERT INTO posts (uri, actor_id, content)
+        VALUES ('https://localhost/', ?, ?)
+        RETURNING *
+        `,
+      )
+      .get(actor.id, stringifyEntities(content, { escapeOnly: true }));
+    if (post == null) return null;
+    const url = ctx.getObjectUri(Note, {
+      identifier: username,
+      id: post.id.toString(),
+    }).href;
+    db.prepare("UPDATE posts SET uri = ?, url = ? WHERE id = ?").run(
+      url,
+      url,
+      post.id,
+    );
+    return url;
+  })();
+  if (url == null) return c.text("Failed to create post", 500);
+  return c.redirect(url);
+});
 
 app.get("/users/:username/followers", async (c) => {
   const followers = db
