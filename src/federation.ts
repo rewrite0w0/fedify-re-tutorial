@@ -1,11 +1,7 @@
-import {
-  createFederation,
-  exportJwk,
-  generateCryptoKeyPair,
-  importJwk,
-} from "@fedify/fedify";
+import { createFederation, exportJwk, generateCryptoKeyPair, importJwk } from "@fedify/fedify";
 import {
   Accept,
+  Create,
   Endpoints,
   Follow,
   Note,
@@ -14,12 +10,15 @@ import {
   Undo,
   getActorHandle,
   type Recipient,
+  isActor,
+  type Actor as APActor,
 } from "@fedify/vocab";
 import db from "./db.ts";
-import type { Actor, User, Key,Post } from "./schema.ts";
+import type { Actor, User, Key, Post } from "./schema.ts";
 import { getLogger } from "@logtape/logtape";
 import { InProcessMessageQueue, MemoryKvStore } from "@fedify/fedify";
 import { Temporal } from "@js-temporal/polyfill";
+import { create } from "node:domain";
 
 const logger = getLogger("microblog");
 
@@ -27,6 +26,40 @@ const federation = createFederation({
   kv: new MemoryKvStore(),
   queue: new InProcessMessageQueue(),
 });
+
+async function persistActor(actor: APActor): Promise<Actor | null> {
+  if (actor.id == null || actor.inboxId == null) {
+    logger.debug("Actor is missing required fields: {actor}", { actor });
+    return null;
+  }
+  return (
+    db
+      .prepare<unknown[], Actor>(
+        `
+        -- 액터 레코드를 새로 추가하거나 이미 있으면 갱신
+        INSERT INTO actors (uri, handle, name, inbox_url, shared_inbox_url, url)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT (uri) DO UPDATE SET
+          handle = excluded.handle,
+          name = excluded.name,
+          inbox_url = excluded.inbox_url,
+          shared_inbox_url = excluded.shared_inbox_url,
+          url = excluded.url
+        WHERE
+          actors.uri = excluded.uri
+        RETURNING *
+        `,
+      )
+      .get(
+        actor.id.href,
+        await getActorHandle(actor),
+        actor.name?.toString(),
+        actor.inboxId.href,
+        actor.endpoints?.sharedInbox?.href,
+        actor.url?.href,
+      ) ?? null
+  );
+}
 
 federation
   .setActorDispatcher("/users/{identifier}", async (ctx, identifier) => {
@@ -64,18 +97,16 @@ federation
     const rows = db
       .prepare<unknown[], Key>("SELECT * FROM keys WHERE keys.user_id = ?")
       .all(user.id);
-    const keys = Object.fromEntries(
-      rows.map((row) => [row.type, row]),
-    ) as Record<Key["type"], Key>;
+    const keys = Object.fromEntries(rows.map((row) => [row.type, row])) as Record<Key["type"], Key>;
     const pairs: CryptoKeyPair[] = [];
     // 사용자가 지원하는 두 키 형식 (RSASSA-PKCS1-v1_5 및 Ed25519) 각각에 대해
     // 키 쌍을 보유하고 있는지 확인하고, 없으면 생성 후 데이터베이스에 저장:
     for (const keyType of ["RSASSA-PKCS1-v1_5", "Ed25519"] as const) {
       if (keys[keyType] == null) {
-        logger.debug(
-          "The user {identifier} does not have an {keyType} key; creating one...",
-          { identifier, keyType },
-        );
+        logger.debug("The user {identifier} does not have an {keyType} key; creating one...", {
+          identifier,
+          keyType,
+        });
         const { privateKey, publicKey } = await generateCryptoKeyPair(keyType);
         db.prepare(
           `
@@ -91,14 +122,8 @@ federation
         pairs.push({ privateKey, publicKey });
       } else {
         pairs.push({
-          privateKey: await importJwk(
-            JSON.parse(keys[keyType].private_key),
-            "private",
-          ),
-          publicKey: await importJwk(
-            JSON.parse(keys[keyType].public_key),
-            "public",
-          ),
+          privateKey: await importJwk(JSON.parse(keys[keyType].private_key), "private"),
+          publicKey: await importJwk(JSON.parse(keys[keyType].public_key), "public"),
         });
       }
     }
@@ -137,41 +162,17 @@ federation
         `,
       )
       .get(object.identifier)?.id;
+
     if (followingId == null) {
-      logger.debug(
-        "Failed to find the actor to follow in the database: {object}",
-        { object },
-      );
-      return;
+      logger.debug("Failed to find the actor to follow in the database: {object}", { object });
     }
-    const followerId = db
-      .prepare<unknown[], Actor>(
-        `
-        -- 팔로워 액터 레코드를 새로 추가하거나 이미 있으면 갱신
-        INSERT INTO actors (uri, handle, name, inbox_url, shared_inbox_url, url)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT (uri) DO UPDATE SET
-          handle = excluded.handle,
-          name = excluded.name,
-          inbox_url = excluded.inbox_url,
-          shared_inbox_url = excluded.shared_inbox_url,
-          url = excluded.url
-        WHERE
-          actors.uri = excluded.uri
-        RETURNING *
-        `,
-      )
-      .get(
-        follower.id.href,
-        await getActorHandle(follower),
-        follower.name?.toString(),
-        follower.inboxId.href,
-        follower.endpoints?.sharedInbox?.href,
-        follower.url?.href,
-      )?.id;
-    db.prepare(
-      "INSERT INTO follows (following_id, follower_id) VALUES (?, ?)",
-    ).run(followingId, followerId);
+
+    const followerId = (await persistActor(follower))?.id;
+
+    db.prepare("INSERT INTO follows (following_id, follower_id) VALUES (?, ?)").run(
+      followingId,
+      followerId,
+    );
     const accept = new Accept({
       actor: follow.objectId,
       to: follow.actorId,
@@ -196,15 +197,58 @@ federation
       ) AND follower_id = (SELECT id FROM actors WHERE uri = ?)
       `,
     ).run(parsed.identifier, undo.actorId.href);
+  })
+  .on(Accept, async (ctx, accept) => {
+    const follow = await accept.getObject();
+    if (!(follow instanceof Follow)) return;
+    const following = await accept.getActor();
+    if (!isActor(following)) return;
+    const follower = follow.actorId;
+    if (follower == null) return;
+    const parsed = ctx.parseUri(follower);
+    if (parsed == null || parsed.type !== "actor") return;
+    const followingId = (await persistActor(following))?.id;
+    if (followingId == null) return;
+    db.prepare(
+      `
+      INSERT INTO follows (following_id, follower_id)
+      VALUES (
+        ?,
+        (
+          SELECT actors.id
+          FROM actors
+          JOIN users ON actors.user_id = users.id
+          WHERE users.username = ?
+        )
+      )
+      `,
+    ).run(followingId, parsed.identifier);
+  })
+  .on(Create, async (ctx, create) => {
+    const object = await create.getObject();
+    if (!(object instanceof Note)) return;
+    const actor = create.actorId;
+    if (actor == null) return;
+    const author = await object?.getAttribution();
+    if (!isActor(author) || author.id?.href !== actor.href) return;
+    const actorId = (await persistActor(author))?.id;
+    if (actorId == null) return;
+    if (object.id == null) return;
+    const content = object?.content?.toString();
+
+    db.prepare("INSERT INTO posts (uri, actor_id, content, url) VALUES (?, ?, ?, ?)").run(
+      object.id.href,
+      actorId,
+      content,
+      object.url?.href,
+    );
   });
 
 federation
-  .setFollowersDispatcher(
-    "/users/{identifier}/followers",
-    (ctx, identifier, cursor) => {
-      const followers = db
-        .prepare<unknown[], Actor>(
-          `
+  .setFollowersDispatcher("/users/{identifier}/followers", (ctx, identifier, cursor) => {
+    const followers = db
+      .prepare<unknown[], Actor>(
+        `
           SELECT followers.*
           FROM follows
           JOIN actors AS followers ON follows.follower_id = followers.id
@@ -213,19 +257,15 @@ federation
           WHERE users.username = ?
           ORDER BY follows.created DESC
           `,
-        )
-        .all(identifier);
-      const items: Recipient[] = followers.map((f) => ({
-        id: new URL(f.uri),
-        inboxId: new URL(f.inbox_url),
-        endpoints:
-          f.shared_inbox_url == null
-            ? null
-            : { sharedInbox: new URL(f.shared_inbox_url) },
-      }));
-      return { items };
-    },
-  )
+      )
+      .all(identifier);
+    const items: Recipient[] = followers.map((f) => ({
+      id: new URL(f.uri),
+      inboxId: new URL(f.inbox_url),
+      endpoints: f.shared_inbox_url == null ? null : { sharedInbox: new URL(f.shared_inbox_url) },
+    }));
+    return { items };
+  })
   .setCounter((ctx, identifier) => {
     const result = db
       .prepare<unknown[], { cnt: number }>(
@@ -241,33 +281,29 @@ federation
     return result == null ? 0 : result.cnt;
   });
 
-federation.setObjectDispatcher(
-  Note,
-  "/users/{identifier}/posts/{id}",
-  (ctx, values) => {
-    const post = db
-      .prepare<unknown[], Post>(
-        `
+federation.setObjectDispatcher(Note, "/users/{identifier}/posts/{id}", (ctx, values) => {
+  const post = db
+    .prepare<unknown[], Post>(
+      `
         SELECT posts.*
         FROM posts
         JOIN actors ON actors.id = posts.actor_id
         JOIN users ON users.id = actors.user_id
         WHERE users.username = ? AND posts.id = ?
         `,
-      )
-      .get(values.identifier, values.id);
-    if (post == null) return null;
-    return new Note({
-      id: ctx.getObjectUri(Note, values),
-      attribution: ctx.getActorUri(values.identifier),
-      to: PUBLIC_COLLECTION,
-      cc: ctx.getFollowersUri(values.identifier),
-      content: post.content,
-      mediaType: "text/html",
-      published: Temporal.Instant.from(`${post.created.replace(" ", "T")}Z`),
-      url: ctx.getObjectUri(Note, values),
-    });
-  },
-);
+    )
+    .get(values.identifier, values.id);
+  if (post == null) return null;
+  return new Note({
+    id: ctx.getObjectUri(Note, values),
+    attribution: ctx.getActorUri(values.identifier),
+    to: PUBLIC_COLLECTION,
+    cc: ctx.getFollowersUri(values.identifier),
+    content: post.content,
+    mediaType: "text/html",
+    published: Temporal.Instant.from(`${post.created.replace(" ", "T")}Z`),
+    url: ctx.getObjectUri(Note, values),
+  });
+});
 
 export default federation;

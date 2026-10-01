@@ -1,6 +1,42 @@
 import type { FC } from "hono/jsx";
 import type { Actor, User, Post } from "./schema.ts";
 
+export interface FollowingListProps {
+  following: Actor[];
+}
+
+export const FollowingList: FC<FollowingListProps> = ({ following }) => {
+  return (
+    <>
+      <h2>Following</h2>
+      또시작이네
+      {typeof following}
+      {following.length}
+      <ul>
+        {following.map((actor) => (
+          <li key={actor.id}>
+            <ActorLink actor={actor} />
+          </li>
+        ))}
+      </ul>
+    </>
+  );
+};
+
+export interface PostListProps {
+  posts: (Post & Actor)[];
+}
+
+export const PostList: FC<PostListProps> = ({ posts }) => (
+  <>
+    {posts.map((post) => (
+      <div key={post.id}>
+        <PostView post={post} />
+      </div>
+    ))}
+  </>
+);
+
 export interface PostPageProps extends ProfileProps, PostViewProps {}
 
 export const PostPage: FC<PostPageProps> = (props) => (
@@ -10,6 +46,7 @@ export const PostPage: FC<PostPageProps> = (props) => (
       username={props.username}
       handle={props.handle}
       followers={props.followers}
+      following={props.following}
     />
     <PostView post={props.post} />
   </>
@@ -24,23 +61,21 @@ export const PostView: FC<PostViewProps> = ({ post }) => (
     <header>
       <ActorLink actor={post} />
     </header>
-
+    {/* biome-ignore lint/security/noDangerouslySetInnerHtml: */}
     <div dangerouslySetInnerHTML={{ __html: post.content }} />
     <footer>
       <a href={post.url ?? post.uri}>
-        <time datetime={new Date(post.created).toISOString()}>
-          {post.created}
-        </time>
+        <time datetime={new Date(post.created).toISOString()}>{post.created}</time>
       </a>
     </footer>
   </article>
 );
 
-export interface HomeProps {
+export interface HomeProps extends PostListProps {
   user: User & Actor;
 }
 
-export const Home: FC<HomeProps> = ({ user }) => (
+export const Home: FC<HomeProps> = ({ user, posts }) => (
   <>
     <hgroup>
       <h1>{user.name}'s microblog</h1>
@@ -48,6 +83,18 @@ export const Home: FC<HomeProps> = ({ user }) => (
         <a href={`/users/${user.username}`}>{user.name}'s profile</a>
       </p>
     </hgroup>
+    <form method="post" action={`/users/${user.username}/following`}>
+      {/* biome-ignore lint/a11y/noRedundantRoles: PicoCSS가 role=group을 요구함 */}
+      <fieldset role="group">
+        <input
+          type="text"
+          name="actor"
+          required={true}
+          placeholder="Enter an actor handle (e.g., @johndoe@mastodon.com) or URI (e.g., https://mastodon.com/@johndoe)"
+        />
+        <input type="submit" value="Follow" />
+      </fieldset>
+    </form>
     <form method="post" action={`/users/${user.username}/posts`}>
       <fieldset>
         <label>
@@ -56,6 +103,7 @@ export const Home: FC<HomeProps> = ({ user }) => (
       </fieldset>
       <input type="submit" value="Post" />
     </form>
+    <PostList posts={posts} />
   </>
 );
 
@@ -104,29 +152,27 @@ export interface ProfileProps {
   name: string;
   username: string;
   handle: string;
+  following: number;
   followers: number;
 }
 
-export const Profile: FC<ProfileProps> = ({
-  name,
-  username,
-  handle,
-  followers,
-}) => (
+export const Profile: FC<ProfileProps> = ({ name, username, handle, following, followers }) => (
   <>
     <hgroup>
       <h1>
         <a href={`/users/${username}`}>{name}</a>
       </h1>
       <p>
-        <span style="user-select: all;">{handle}</span> &middot;
+        <span style="user-select: all;">{handle}</span> &middot;{" "}
+        <a href={`/users/${username}/following`}>{following} following</a> &middot;{" "}
         <a href={`/users/${username}/followers`}>
-          {followers == 1 ? "1 follower" : `${followers} followers`}
+          {followers === 1 ? "1 follower" : `${followers} followers`}
         </a>
       </p>
     </hgroup>
   </>
 );
+
 export const SetupForm: FC = () => (
   <>
     <h1>Set up your microblog</h1>
@@ -134,13 +180,7 @@ export const SetupForm: FC = () => (
       <fieldset>
         <label>
           Username{" "}
-          <input
-            type="text"
-            name="username"
-            required
-            maxlength={50}
-            pattern="^[a-z0-9_\-]+$"
-          />
+          <input type="text" name="username" required maxlength={50} pattern="^[a-z0-9_\-]+$" />
         </label>
         <label>
           Name <input type="text" name="name" required />
@@ -158,10 +198,7 @@ export const Layout: FC = (props) => (
       <meta name="viewport" content="width=device-width, initial-scale=1" />
       <meta name="color-scheme" content="light dark" />
       <title>Microblog</title>
-      <link
-        rel="stylesheet"
-        href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css"
-      />
+      <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css" />
     </head>
     <body>
       <main class="container">{props.children}</main>

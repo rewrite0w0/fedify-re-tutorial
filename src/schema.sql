@@ -44,7 +44,6 @@ CREATE TABLE IF NOT EXISTS follows (
   PRIMARY KEY (following_id, follower_id)
 );
 
-
 CREATE TABLE IF NOT EXISTS posts (
   id       INTEGER NOT NULL PRIMARY KEY,
   uri      TEXT    NOT NULL UNIQUE CHECK (uri <> ''),

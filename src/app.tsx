@@ -2,14 +2,16 @@
 import { Hono } from "hono";
 import { federation } from "@fedify/hono";
 import fedi from "./federation.ts";
-import { Note } from "@fedify/vocab";
+import { Create, Note, Follow, isActor } from "@fedify/vocab";
 import {
   Layout,
   SetupForm,
   Profile,
   FollowerList,
+  FollowingList,
   Home,
   PostPage,
+  PostList,
 } from "./views.tsx";
 import db from "./db.ts";
 import type { User, Actor, Post } from "./schema.ts";
@@ -17,6 +19,55 @@ import { stringifyEntities } from "stringify-entities";
 
 const app = new Hono();
 app.use(federation(fedi, () => undefined));
+
+app.get("/users/:username/following", async (c) => {
+  const following = db
+    .prepare<unknown[], Actor>(
+      `
+      SELECT following.*
+      FROM follows
+      JOIN actors AS followers ON follows.follower_id = followers.id
+      JOIN actors AS following ON follows.following_id = following.id
+      JOIN users ON users.id = followers.user_id
+      WHERE users.username = ?
+      ORDER BY follows.created DESC
+      `,
+    )
+    .all(c.req.param("username"));
+  return c.html(
+    <Layout>
+      ??????
+      <FollowingList following={following} />
+    </Layout>,
+  );
+});
+
+app.post("/users/:username/following", async (c) => {
+  const username = c.req.param("username");
+  const form = await c.req.formData();
+  const handle = form.get("actor");
+  if (typeof handle !== "string") {
+    return c.text("Invalid actor handle or URL", 400);
+  }
+
+  const ctx = fedi.createContext(c.req.raw, undefined);
+  const actor = await ctx.lookupObject(handle.trim());
+
+  if (!isActor(actor)) {
+    return c.text("Invalid actor handle or URL", 400);
+  }
+
+  await ctx.sendActivity(
+    { identifier: username },
+    actor,
+    new Follow({
+      actor: ctx.getActorUri(username),
+      object: actor.id,
+      to: actor.id,
+    }),
+  );
+  return c.text("Successfully sent a follow request");
+});
 
 app.get("/users/:username/posts/:id", (c) => {
   const post = db
@@ -33,15 +84,15 @@ app.get("/users/:username/posts/:id", (c) => {
   if (post == null) return c.notFound();
 
   // biome-ignore lint/style/noNonNullAssertion: 언제나 하나의 레코드를 반환
-  const { followers } = db
-    .prepare<unknown[], { followers: number }>(
+  const { following, followers } = db
+    .prepare<unknown[], { following: number; followers: number }>(
       `
-      SELECT count(*) AS followers
+      SELECT sum(follows.follower_id = ?) AS following,
+             sum(follows.following_id = ?) AS followers
       FROM follows
-      WHERE follows.following_id = ?
       `,
     )
-    .get(post.actor_id)!;
+    .get(post.actor_id, post.actor_id)!;
   return c.html(
     <Layout>
       <PostPage
@@ -49,6 +100,7 @@ app.get("/users/:username/posts/:id", (c) => {
         username={post.username}
         handle={post.handle}
         followers={followers}
+        following={following}
         post={post}
       />
     </Layout>,
@@ -74,6 +126,41 @@ app.post("/users/:username/posts", async (c) => {
     return c.text("Content is required", 400);
   }
   const ctx = fedi.createContext(c.req.raw, undefined);
+
+  const post: Post | null = db.transaction(() => {
+    const post = db
+      .prepare<unknown[], Post>(
+        `
+        INSERT INTO posts (uri, actor_id, content)
+        VALUES ('https://localhost/', ?, ?)
+        RETURNING *
+        `,
+      )
+      .get(actor.id, stringifyEntities(content, { escapeOnly: true }));
+    if (post == null) return null;
+    const url = ctx.getObjectUri(Note, {
+      identifier: username,
+      id: post.id.toString(),
+    }).href;
+    db.prepare("UPDATE posts SET uri = ?, url = ? WHERE id = ?").run(url, url, post.id);
+    return post;
+  })();
+  if (post == null) return c.text("Failed to create post", 500);
+  const noteArgs = { identifier: username, id: post.id.toString() };
+  const note = await ctx.getObject(Note, noteArgs);
+  await ctx.sendActivity(
+    { identifier: username },
+    "followers",
+    new Create({
+      id: new URL("#activity", note?.id ?? undefined),
+      object: note,
+      actors: note?.attributionIds,
+      tos: note?.toIds,
+      ccs: note?.ccIds,
+    }),
+  );
+  return c.redirect(ctx.getObjectUri(Note, noteArgs).href);
+
   const url: string | null = db.transaction(() => {
     const post = db
       .prepare<unknown[], Post>(
@@ -89,11 +176,7 @@ app.post("/users/:username/posts", async (c) => {
       identifier: username,
       id: post.id.toString(),
     }).href;
-    db.prepare("UPDATE posts SET uri = ?, url = ? WHERE id = ?").run(
-      url,
-      url,
-      post.id,
-    );
+    db.prepare("UPDATE posts SET uri = ?, url = ? WHERE id = ?").run(url, url, post.id);
     return url;
   })();
   if (url == null) return c.text("Failed to create post", 500);
@@ -126,6 +209,34 @@ app.get("/users/:username", async (c) => {
     .prepare<unknown[], User>("SELECT * FROM users WHERE username = ?")
     .get(c.req.param("username"));
   if (user == null) return c.notFound();
+
+  // biome-ignore lint/style/noNonNullAssertion: 언제나 하나의 레코드를 반환
+  const { following } = db
+    .prepare<unknown[], { following: number }>(
+      `
+      SELECT count(*) AS following
+      FROM follows
+      JOIN actors ON follows.follower_id = actors.id
+      WHERE actors.user_id = ?
+      `,
+    )
+    .get(user.id)!;
+
+  const posts = db
+    .prepare<unknown[], Post & Actor>(
+      `
+      SELECT actors.*, posts.*
+      FROM posts
+      JOIN actors ON posts.actor_id = actors.id
+      WHERE actors.user_id = ?
+      ORDER BY posts.created DESC
+      `,
+    )
+    .all(user.id);
+
+  const url = new URL(c.req.url);
+  const handle = `@${user.username}@${url.host}`;
+
   // biome-ignore lint/style/noNonNullAssertion: 언제나 하나의 레코드를 반환
   const { followers } = db
     .prepare<unknown[], { followers: number }>(
@@ -138,8 +249,6 @@ app.get("/users/:username", async (c) => {
     )
     .get(user.id)!;
 
-  const url = new URL(c.req.url);
-  const handle = `@${user.username}@${url.host}`;
   return c.html(
     <Layout>
       <Profile
@@ -147,7 +256,9 @@ app.get("/users/:username", async (c) => {
         username={user.username}
         handle={handle}
         followers={followers}
+        following={following}
       />
+      <PostList posts={posts} />
     </Layout>,
   );
 });
@@ -178,9 +289,7 @@ app.post("/setup", async (c) => {
   const handle = `@${username}@${url.host}`;
   const ctx = fedi.createContext(c.req.raw, undefined);
   db.transaction(() => {
-    db.prepare("INSERT OR REPLACE INTO users (id, username) VALUES (1, ?)").run(
-      username,
-    );
+    db.prepare("INSERT OR REPLACE INTO users (id, username) VALUES (1, ?)").run(username);
     db.prepare(
       `
       INSERT OR REPLACE INTO actors
@@ -219,45 +328,6 @@ app.get("/setup", (c) => {
   );
 });
 
-app.get("/users/:username", async (c) => {
-  const user = db
-    .prepare<unknown[], User & Actor>(
-      `
-      SELECT * FROM users
-      JOIN actors ON (users.id = actors.user_id)
-      WHERE username = ?
-      `,
-    )
-    .get(c.req.param("username"));
-
-  if (user == null) return c.notFound();
-
-  const url = new URL(c.req.url);
-  const handle = `@${user.username}@${url.host}`;
-  // biome-ignore lint/style/noNonNullAssertion: 언제나 하나의 레코드를 반환
-  const { followers } = db
-    .prepare<unknown[], { followers: number }>(
-      `
-      SELECT count(*) AS followers
-      FROM follows
-      JOIN actors ON follows.following_id = actors.id
-      WHERE actors.user_id = ?
-      `,
-    )
-    .get(user.id)!;
-
-  return c.html(
-    <Layout>
-      <Profile
-        name={user.name ?? user.username}
-        username={user.username}
-        handle={handle}
-        followers={followers}
-      />
-    </Layout>,
-  );
-});
-
 app.get("/", (c) => {
   const user = db
     .prepare<unknown[], User & Actor>(
@@ -271,9 +341,25 @@ app.get("/", (c) => {
     .get();
   if (user == null) return c.redirect("/setup");
 
+  const posts = db
+    .prepare<unknown[], Post & Actor>(
+      `
+      SELECT actors.*, posts.*
+      FROM posts
+      JOIN actors ON posts.actor_id = actors.id
+      WHERE posts.actor_id = ? OR posts.actor_id IN (
+        SELECT following_id
+        FROM follows
+        WHERE follower_id = ?
+      )
+      ORDER BY posts.created DESC
+      `,
+    )
+    .all(user.id, user.id);
+
   return c.html(
     <Layout>
-      <Home user={user} />
+      <Home user={user} posts={posts} />
     </Layout>,
   );
 });
